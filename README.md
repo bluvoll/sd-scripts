@@ -9,20 +9,20 @@ A shitty experiment of Rectified Flow for SDXL you can find it here in [Civitai]
 
 ## Additional Commands
 
---flow_model Required to train into Rectified Flow target 
---flow_use_ot Not needed, want info? ask lodestone
---flow_timestep_distribution = uniform or logit_normal, just run uniform
---flow_uniform_static_ratio allows static values for shift, default 2.5
---contrastive_flow_matching Magic thingie that makes training results a bit sharper
---cfm_lambda needed by the one above, default 0.05, I prefer 0.02
---flow_logit_mean needed by logit_normal timestep_distribution
---flow_logit_std needed by logit_normal timestep_distribution
---flow_uniform_base_pixels default 1048576 or 1024x1024 allows dynamic shifting based on resolutions useful for higher than 1024x1024 training.
---flow_uniform_shift allows dynamic shifting
---vae_custom_scale suggested for Anzhc's eq-vae put 0.1406
---vae_custom_shift suggested for Anzhc's eq-vae put -0.4743
---vae_reflection_padding suggested to use with Anzhc's eq-vae, my shitty experiment wasn't trained with this.
---use_sga attaches Lodestone's stochastic accumulator for gradient accumulation, currently borked.
+- --flow_model Required to train into Rectified Flow target 
+- --flow_use_ot Not needed, want info? ask lodestone
+- --flow_timestep_distribution = uniform or logit_normal, just run uniform
+- --flow_uniform_static_ratio allows static values for shift, default 2.5
+- --contrastive_flow_matching Magic thingie that makes training results a bit sharper
+- --cfm_lambda needed by the one above, default 0.05, I prefer 0.02
+- --flow_logit_mean needed by logit_normal timestep_distribution
+- --flow_logit_std needed by logit_normal timestep_distribution
+- --flow_uniform_base_pixels default 1048576 or 1024x1024 allows dynamic shifting based on resolutions useful for higher than 1024x1024 training.
+- --flow_uniform_shift allows dynamic shifting
+- --vae_custom_scale suggested for Anzhc's eq-vae put 0.1406
+- --vae_custom_shift suggested for Anzhc's eq-vae put -0.4743
+- --vae_reflection_padding suggested to use with Anzhc's eq-vae, my shitty experiment wasn't trained with this.
+- --use_sga attaches Lodestone's stochastic accumulator for gradient accumulation, currently borked.
 
 You can use launch_all_train.sh to start training, or copy the command to an activated venv, works on windows or linux w/e the file itself has a working template
 
