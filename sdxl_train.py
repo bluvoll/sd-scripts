@@ -17,7 +17,7 @@ init_ipex()
 
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler
-from library import deepspeed_utils, sdxl_model_util
+from library import deepspeed_utils, sdxl_model_util, model_util
 
 import library.train_util as train_util
 
@@ -118,6 +118,60 @@ def train(args):
     else:
         block_lrs = None
 
+    vae_scale_factor = sdxl_model_util.VAE_SCALE_FACTOR
+    vae_shift_factor = 0.0
+    if args.vae_custom_scale is not None:
+        vae_scale_factor = float(args.vae_custom_scale)
+        logger.info(f"Using custom VAE scale factor: {vae_scale_factor}")
+    if args.vae_custom_shift is not None:
+        vae_shift_factor = float(args.vae_custom_shift)
+        logger.info(f"Using custom VAE shift factor: {vae_shift_factor}")
+    args.vae_scale_factor = vae_scale_factor
+    args.vae_shift_factor = vae_shift_factor
+
+    if args.flow_model:
+        logger.info("Using Rectified Flow training objective.")
+        if args.v_parameterization:
+            raise ValueError("`--flow_model` is incompatible with `--v_parameterization`; Rectified Flow already predicts velocity.")
+        if args.min_snr_gamma:
+            logger.warning("`--min_snr_gamma` is ignored when Rectified Flow is enabled.")
+            args.min_snr_gamma = None
+        if args.debiased_estimation_loss:
+            logger.warning("`--debiased_estimation_loss` is ignored when Rectified Flow is enabled.")
+            args.debiased_estimation_loss = False
+        if args.scale_v_pred_loss_like_noise_pred:
+            logger.warning("`--scale_v_pred_loss_like_noise_pred` is ignored when Rectified Flow is enabled.")
+            args.scale_v_pred_loss_like_noise_pred = False
+        if args.v_pred_like_loss:
+            logger.warning("`--v_pred_like_loss` is ignored when Rectified Flow is enabled.")
+            args.v_pred_like_loss = None
+        if args.flow_use_ot:
+            logger.info("Using cosine optimal transport pairing for Rectified Flow batches.")
+        if args.flow_timestep_distribution == "logit_normal":
+            if args.flow_logit_std <= 0:
+                raise ValueError("`--flow_logit_std` must be positive.")
+            logger.info(
+                "Rectified Flow timesteps sampled from logit-normal distribution with "
+                f"mean={args.flow_logit_mean}, std={args.flow_logit_std}."
+            )
+        elif args.flow_timestep_distribution == "uniform":
+            logger.info("Rectified Flow timesteps sampled uniformly in [0, 1].")
+            if args.flow_uniform_static_ratio is not None:
+                if args.flow_uniform_static_ratio <= 0:
+                    raise ValueError("`--flow_uniform_static_ratio` must be positive.")
+                logger.info(
+                    f"Applying uniform timestep shift with static ratio={args.flow_uniform_static_ratio}."
+                )
+            elif args.flow_uniform_shift:
+                logger.info(
+                    f"Applying resolution-dependent uniform timestep shift with base pixels={args.flow_uniform_base_pixels}."
+                )
+        else:
+            raise ValueError(f"Unknown Rectified Flow timestep distribution: {args.flow_timestep_distribution}")
+
+    if args.contrastive_flow_matching and not (args.v_parameterization or args.flow_model):
+        raise ValueError("`--contrastive_flow_matching` requires either v-parameterization or Rectified Flow.")
+
     cache_latents = args.cache_latents
     use_dreambooth_method = args.in_json is None
 
@@ -215,6 +269,8 @@ def train(args):
         logit_scale,
         ckpt_info,
     ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype)
+    if args.vae_reflection_padding:
+        vae = model_util.use_reflection_padding(vae)
     # logit_scale = logit_scale.to(accelerator.device, dtype=weight_dtype)
 
     # verify load/save model formats
@@ -626,7 +682,9 @@ def train(args):
                         if torch.any(torch.isnan(latents)):
                             accelerator.print("NaN found in latents, replacing with zeros")
                             latents = torch.nan_to_num(latents, 0, out=latents)
-                latents = latents * sdxl_model_util.VAE_SCALE_FACTOR
+                if args.vae_shift_factor != 0.0:
+                    latents = latents - args.vae_shift_factor
+                latents = latents * args.vae_scale_factor
 
                 if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
                     input_ids1 = batch["input_ids"]
@@ -690,10 +748,21 @@ def train(args):
                 vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
                 text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
 
+                needs_dynamic_shift = (
+                    args.flow_model
+                    and args.flow_timestep_distribution == "uniform"
+                    and args.flow_uniform_shift
+                    and args.flow_uniform_static_ratio is None
+                )
+                if needs_dynamic_shift:
+                    pixel_counts = (target_size[:, 0] * target_size[:, 1]).to(latents.device, torch.float32)
+                else:
+                    pixel_counts = None
+
                 # Sample noise, sample a random timestep for each image, and add noise to the latents,
                 # with noise offset and/or multires noise if specified
                 noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
-                    args, noise_scheduler, latents
+                    args, noise_scheduler, latents, pixel_counts=pixel_counts
                 )
 
                 noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
@@ -702,8 +771,9 @@ def train(args):
                 with accelerator.autocast():
                     noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
 
-                if args.v_parameterization:
-                    # v-parameterization training
+                if args.flow_model:
+                    target = noise - latents
+                elif args.v_parameterization:
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     target = noise
@@ -715,10 +785,21 @@ def train(args):
                     or args.debiased_estimation_loss
                     or args.masked_loss
                 ):
-                    # do not mean over batch dimension for snr weight or scale v-pred loss
                     loss = train_util.conditional_loss(
                         noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
                     )
+                    if args.contrastive_flow_matching and latents.size(0) > 1:
+                        negative_latents = latents.roll(1, 0)
+                        negative_noise = noise.roll(1, 0)
+                        with torch.no_grad():
+                            if args.flow_model:
+                                target_negative = negative_noise - negative_latents
+                            else:
+                                target_negative = noise_scheduler.get_velocity(negative_latents, negative_noise, timesteps)
+                        loss_contrastive = torch.nn.functional.mse_loss(
+                            noise_pred.float(), target_negative.float(), reduction="none"
+                        )
+                        loss = loss - args.cfm_lambda * loss_contrastive
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
                     loss = loss.mean([1, 2, 3])
@@ -732,11 +813,27 @@ def train(args):
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
 
-                    loss = loss.mean()  # mean over batch dimension
+                    loss = loss.mean()
                 else:
-                    loss = train_util.conditional_loss(
-                        noise_pred.float(), target.float(), reduction="mean", loss_type=args.loss_type, huber_c=huber_c
+                    per_pixel_loss = train_util.conditional_loss(
+                        noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
                     )
+                    if args.contrastive_flow_matching and latents.size(0) > 1:
+                        negative_latents = latents.roll(1, 0)
+                        negative_noise = noise.roll(1, 0)
+                        with torch.no_grad():
+                            if args.flow_model:
+                                target_negative = negative_noise - negative_latents
+                            else:
+                                target_negative = noise_scheduler.get_velocity(negative_latents, negative_noise, timesteps)
+                        loss_contrastive = torch.nn.functional.mse_loss(
+                            noise_pred.float(), target_negative.float(), reduction="none"
+                        )
+                        per_pixel_loss = per_pixel_loss - args.cfm_lambda * loss_contrastive
+                    loss = per_pixel_loss.mean()
+
+                if loss.ndim != 0:
+                    loss = loss.mean()
 
                 accelerator.backward(loss)
 
@@ -927,6 +1024,23 @@ def setup_parser() -> argparse.ArgumentParser:
         help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
     )
     parser.add_argument(
+        "--vae_reflection_padding",
+        action="store_true",
+        help="switch VAE convolutions to reflection padding (improves border quality for some custom VAEs) / VAEの畳み込みを反射パディングに切り替える",
+    )
+    parser.add_argument(
+        "--vae_custom_scale",
+        type=float,
+        default=None,
+        help="override the latent scaling factor applied after VAE encode (default matches SDXL) / VAEエンコード後のスケーリング係数を上書きする",
+    )
+    parser.add_argument(
+        "--vae_custom_shift",
+        type=float,
+        default=None,
+        help="apply a constant latent shift before scaling (e.g. Flux-style offset) / スケーリング前に潜在表現へ定数シフトを適用する",
+    )
+    parser.add_argument(
         "--block_lr",
         type=str,
         default=None,
@@ -938,6 +1052,63 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="number of optimizers for fused backward pass and optimizer step / fused backward passとoptimizer stepのためのoptimizer数",
+    )
+    parser.add_argument(
+        "--flow_model",
+        action="store_true",
+        help="enable Rectified Flow training objective instead of standard diffusion / 通常の拡散ではなくRectified Flowで学習する",
+    )
+    parser.add_argument(
+        "--flow_use_ot",
+        action="store_true",
+        help="pair latents and noise with cosine optimal transport when using Rectified Flow / Rectified Flow使用時にOTでlatentとノイズを対応付ける",
+    )
+    parser.add_argument(
+        "--flow_timestep_distribution",
+        type=str,
+        default="logit_normal",
+        choices=["logit_normal", "uniform"],
+        help="sampling distribution over Rectified Flow sigmas (default: logit_normal) / Rectified Flowのシグマの分布（デフォルトlogit_normal）",
+    )
+    parser.add_argument(
+        "--flow_logit_mean",
+        type=float,
+        default=0.0,
+        help="mean of the logit-normal distribution when using Rectified Flow / Rectified Flowでlogit-normal分布を用いるときの平均値",
+    )
+    parser.add_argument(
+        "--flow_logit_std",
+        type=float,
+        default=1.0,
+        help="stddev of the logit-normal distribution when using Rectified Flow / Rectified Flowでlogit-normal分布を用いるときの標準偏差",
+    )
+    parser.add_argument(
+        "--flow_uniform_shift",
+        action="store_true",
+        help="apply resolution-dependent shift to uniform Rectified Flow timesteps (SD3-style) / UniformなRectified Flowタイムステップに解像度依存のシフトを適用する",
+    )
+    parser.add_argument(
+        "--flow_uniform_base_pixels",
+        type=float,
+        default=1024.0 * 1024.0,
+        help="reference pixel count used for the resolution-dependent timestep shift / タイムステップシフトで使用する基準ピクセル数",
+    )
+    parser.add_argument(
+        "--flow_uniform_static_ratio",
+        type=float,
+        default=None,
+        help="use a fixed sqrt(m/n) ratio (e.g. 2.5) for uniform Rectified Flow timestep shift; overrides resolution-based shift / 一定のsqrt(m/n)比率（例:2.5）でUniformなRectified Flowタイムステップをシフトする（解像度依存シフトを上書き）",
+    )
+    parser.add_argument(
+        "--contrastive_flow_matching",
+        action="store_true",
+        help="Enable Contrastive Flow Matching (ΔFM) objective. Works with v-parameterization or Rectified Flow.",
+    )
+    parser.add_argument(
+        "--cfm_lambda",
+        type=float,
+        default=0.05,
+        help="Lambda weight for the contrastive term in ΔFM loss (default: 0.05).",
     )
     return parser
 

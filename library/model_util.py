@@ -5,6 +5,7 @@ import math
 import os
 
 import torch
+from torch import nn
 from library.device_utils import init_ipex
 init_ipex()
 
@@ -1304,6 +1305,25 @@ def load_vae(vae_id, dtype):
 
     vae = AutoencoderKL(**vae_config)
     vae.load_state_dict(converted_vae_checkpoint)
+    return vae
+
+
+def use_reflection_padding(vae):
+    """Switch padded convolutions in a VAE to reflection padding."""
+    updated = 0
+    for module in vae.modules():
+        if isinstance(module, nn.Conv2d):
+            if isinstance(module.padding, tuple):
+                pad_h, pad_w = module.padding
+            else:
+                pad_h = pad_w = module.padding
+            if pad_h > 0 or pad_w > 0:
+                module.padding_mode = "reflect"
+                updated += 1
+    if updated > 0:
+        logger.info(f"enabled reflection padding for {updated} VAE conv layers")
+    else:
+        logger.info("VAE reflection padding requested but no padded convolutions were found")
     return vae
 
 

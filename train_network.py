@@ -40,6 +40,24 @@ from library.custom_train_functions import (
 )
 from library.utils import setup_logging, add_logging_arguments
 
+# Optional stochastic gradient accumulation helpers
+try:
+    from optimizer_utils import stochastic_grad_accummulation as _sga_helper
+    from optimizer_utils import copy_stochastic as _copy_stochastic
+    _HAS_SGA_HELPERS = True
+except Exception:
+    _HAS_SGA_HELPERS = False
+
+    def _sga_helper(param):
+        if not hasattr(param, "_accum_grad"):
+            param._accum_grad = param.grad.detach().clone()
+        else:
+            param._accum_grad.add_(param.grad)
+        del param.grad
+
+    def _copy_stochastic(target: torch.Tensor, source: torch.Tensor):
+        target.copy_(source)
+
 setup_logging()
 import logging
 
@@ -50,6 +68,7 @@ class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
+        self.latent_shift = 0.0
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -108,6 +127,9 @@ class NetworkTrainer:
     def is_text_encoder_outputs_cached(self, args):
         return False
 
+    def get_flow_pixel_counts(self, args, batch, latents):
+        return None
+
     def is_train_text_encoder(self, args):
         return not args.network_train_unet_only and not self.is_text_encoder_outputs_cached(args)
 
@@ -141,6 +163,70 @@ class NetworkTrainer:
         train_util.prepare_dataset_args(args, True)
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
+
+        if getattr(args, "flow_model", False):
+            logger.info("Using Rectified Flow training objective.")
+            if args.v_parameterization:
+                raise ValueError("`--flow_model` is incompatible with `--v_parameterization`; Rectified Flow already predicts velocity.")
+            if args.min_snr_gamma:
+                logger.warning("`--min_snr_gamma` is ignored when Rectified Flow is enabled.")
+                args.min_snr_gamma = None
+            if args.debiased_estimation_loss:
+                logger.warning("`--debiased_estimation_loss` is ignored when Rectified Flow is enabled.")
+                args.debiased_estimation_loss = False
+            if args.scale_v_pred_loss_like_noise_pred:
+                logger.warning("`--scale_v_pred_loss_like_noise_pred` is ignored when Rectified Flow is enabled.")
+                args.scale_v_pred_loss_like_noise_pred = False
+            if args.v_pred_like_loss:
+                logger.warning("`--v_pred_like_loss` is ignored when Rectified Flow is enabled.")
+                args.v_pred_like_loss = None
+            if args.flow_use_ot:
+                logger.info("Using cosine optimal transport pairing for Rectified Flow batches.")
+                
+            distribution = getattr(args, "flow_timestep_distribution", "logit_normal")
+            if distribution == "logit_normal":
+                if args.flow_logit_std <= 0:
+                    raise ValueError("`--flow_logit_std` must be positive.")
+                logger.info(
+                    "Rectified Flow timesteps sampled from logit-normal distribution with "
+                    f"mean={args.flow_logit_mean}, std={args.flow_logit_std}."
+                )
+            elif distribution == "uniform":
+                if args.flow_uniform_static_ratio is not None:
+                    if args.flow_uniform_static_ratio <= 0:
+                        raise ValueError("`--flow_uniform_static_ratio` must be positive.")
+                    logger.info(
+                        f"Rectified Flow uniform timestep shift uses static ratio={args.flow_uniform_static_ratio}."
+                    )
+                elif args.flow_uniform_shift:
+                    logger.info(
+                        f"Rectified Flow uniform timestep shift uses base pixels={args.flow_uniform_base_pixels}."
+                    )
+                else:
+                    logger.info("Rectified Flow timesteps sampled uniformly in [0, 1] without additional shift.")
+            else:
+                raise ValueError(f"Unknown Rectified Flow timestep distribution: {distribution}")
+
+        if args.contrastive_flow_matching and not (args.v_parameterization or getattr(args, "flow_model", False)):
+            raise ValueError("`--contrastive_flow_matching` requires either v-parameterization or Rectified Flow.")
+
+        if getattr(args, "vae_custom_scale", None) is not None:
+            try:
+                self.vae_scale_factor = float(args.vae_custom_scale)
+            except (TypeError, ValueError):
+                raise ValueError("`--vae_custom_scale` must be a valid number")
+            logger.info(f"Using custom VAE scale factor: {self.vae_scale_factor}")
+        if getattr(args, "vae_custom_shift", None) is not None:
+            try:
+                self.latent_shift = float(args.vae_custom_shift)
+            except (TypeError, ValueError):
+                raise ValueError("`--vae_custom_shift` must be a valid number")
+            logger.info(f"Using custom VAE shift factor: {self.latent_shift}")
+        else:
+            self.latent_shift = 0.0
+
+        args.vae_scale_factor = self.vae_scale_factor
+        args.vae_shift_factor = self.latent_shift
 
         cache_latents = args.cache_latents
         use_dreambooth_method = args.in_json is None
@@ -232,6 +318,8 @@ class NetworkTrainer:
 
         # モデルを読み込む
         model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
+        if getattr(args, "vae_reflection_padding", False):
+            vae = model_util.use_reflection_padding(vae)
 
         # text_encoder is List[CLIPTextModel] or CLIPTextModel
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
@@ -767,6 +855,10 @@ class NetworkTrainer:
                 vae_name = os.path.basename(vae_name)
             metadata["ss_vae_name"] = vae_name
 
+        metadata["ss_vae_scale_factor"] = self.vae_scale_factor
+        metadata["ss_vae_shift_factor"] = self.latent_shift
+        metadata["ss_vae_reflection_padding"] = getattr(args, "vae_reflection_padding", False)
+
         metadata = {k: str(v) for k, v in metadata.items()}
 
         # make minimum metadata for filtering
@@ -928,6 +1020,8 @@ class NetworkTrainer:
                         if torch.any(torch.isnan(latents)):
                             accelerator.print("NaN found in latents, replacing with zeros")
                             latents = torch.nan_to_num(latents, 0, out=latents)
+                    if self.latent_shift != 0.0:
+                        latents = latents - self.latent_shift
                     latents = latents * self.vae_scale_factor
 
                     # get multiplier for each sample
@@ -957,10 +1051,10 @@ class NetworkTrainer:
                                 args, accelerator, batch, tokenizers, text_encoders, weight_dtype
                             )
 
-                    # Sample noise, sample a random timestep for each image, and add noise to the latents,
-                    # with noise offset and/or multires noise if specified
+                    pixel_counts = self.get_flow_pixel_counts(args, batch, latents)
+
                     noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
-                        args, noise_scheduler, latents
+                        args, noise_scheduler, latents, pixel_counts=pixel_counts
                     )
 
                     # ensure the hidden state will require grad
@@ -983,8 +1077,9 @@ class NetworkTrainer:
                             weight_dtype,
                         )
 
-                    if args.v_parameterization:
-                        # v-parameterization training
+                    if getattr(args, "flow_model", False):
+                        target = noise - latents
+                    elif args.v_parameterization:
                         target = noise_scheduler.get_velocity(latents, noise, timesteps)
                     else:
                         target = noise
@@ -992,6 +1087,18 @@ class NetworkTrainer:
                     loss = train_util.conditional_loss(
                         noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
                     )
+                    if args.contrastive_flow_matching and latents.size(0) > 1:
+                        negative_latents = latents.roll(1, 0)
+                        negative_noise = noise.roll(1, 0)
+                        with torch.no_grad():
+                            if getattr(args, "flow_model", False):
+                                target_negative = negative_noise - negative_latents
+                            else:
+                                target_negative = noise_scheduler.get_velocity(negative_latents, negative_noise, timesteps)
+                        loss_contrastive = torch.nn.functional.mse_loss(
+                            noise_pred.float(), target_negative.float(), reduction="none"
+                        )
+                        loss = loss - args.cfm_lambda * loss_contrastive
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
                     loss = loss.mean([1, 2, 3])
@@ -1010,7 +1117,28 @@ class NetworkTrainer:
 
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
+                    if loss.ndim != 0:
+                        loss = loss.mean()
+
                     accelerator.backward(loss)
+
+                    if getattr(args, "use_sga", True):
+                        if not accelerator.sync_gradients:
+                            for group in optimizer.param_groups:
+                                for param in group["params"]:
+                                    if param.grad is not None:
+                                        _sga_helper(param)
+                            continue
+                        else:
+                            for group in optimizer.param_groups:
+                                for param in group["params"]:
+                                    if hasattr(param, "_accum_grad"):
+                                        if param.grad is None:
+                                            param.grad = param._accum_grad.to(param.device)
+                                        else:
+                                            _copy_stochastic(param.grad, param._accum_grad.to(param.grad.device))
+                                        del param._accum_grad
+
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         if args.max_grad_norm != 0.0:
@@ -1114,6 +1242,8 @@ class NetworkTrainer:
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--use_sga", action="store_true", default=False, help="Use stochastic gradient accumulation across micro-batches.")
+    parser.add_argument("--no_sga", dest="use_sga", action="store_false", help="Disable stochastic gradient accumulation.")
 
     add_logging_arguments(parser)
     train_util.add_sd_models_arguments(parser)
@@ -1232,6 +1362,82 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="initial step number including all epochs, 0 means first step (same as not specifying). overwrites initial_epoch."
         + " / 初期ステップ数、全エポックを含むステップ数、0で最初のステップ（未指定時と同じ）。initial_epochを上書きする",
+    )
+
+    parser.add_argument(
+        "--vae_reflection_padding",
+        action="store_true",
+        help="switch VAE convolutions to reflection padding (improves border quality for some custom VAEs) / VAEの畳み込みを反射パディングに切り替える",
+    )
+    parser.add_argument(
+        "--vae_custom_scale",
+        type=float,
+        default=None,
+        help="override the latent scaling factor applied after VAE encode / VAEエンコード後のスケーリング係数を上書きする",
+    )
+    parser.add_argument(
+        "--vae_custom_shift",
+        type=float,
+        default=None,
+        help="apply a constant latent shift before scaling (e.g. Flux-style offset) / スケーリング前に潜在表現へ定数シフトを適用する",
+    )
+
+    parser.add_argument(
+        "--flow_model",
+        action="store_true",
+        help="enable Rectified Flow training objective instead of standard diffusion / 通常の拡散ではなくRectified Flowで学習する",
+    )
+    parser.add_argument(
+        "--flow_use_ot",
+        action="store_true",
+        help="pair latents and noise with cosine optimal transport when using Rectified Flow / Rectified Flow使用時にOTでlatentとノイズを対応付ける",
+    )
+    parser.add_argument(
+        "--flow_timestep_distribution",
+        type=str,
+        default="logit_normal",
+        choices=["logit_normal", "uniform"],
+        help="sampling distribution over Rectified Flow sigmas (default: logit_normal) / Rectified Flowのシグマの分布（デフォルトlogit_normal）",
+    )
+    parser.add_argument(
+        "--flow_logit_mean",
+        type=float,
+        default=0.0,
+        help="mean of the logit-normal distribution when using Rectified Flow / Rectified Flowでlogit-normal分布を用いるときの平均値",
+    )
+    parser.add_argument(
+        "--flow_logit_std",
+        type=float,
+        default=1.0,
+        help="stddev of the logit-normal distribution when using Rectified Flow / Rectified Flowでlogit-normal分布を用いるときの標準偏差",
+    )
+    parser.add_argument(
+        "--flow_uniform_shift",
+        action="store_true",
+        help="apply resolution-dependent shift to uniform Rectified Flow timesteps (SD3-style) / UniformなRectified Flowタイムステップに解像度依存のシフトを適用する",
+    )
+    parser.add_argument(
+        "--flow_uniform_base_pixels",
+        type=float,
+        default=1024.0 * 1024.0,
+        help="reference pixel count used for the resolution-dependent timestep shift / タイムステップシフトで使用する基準ピクセル数",
+    )
+    parser.add_argument(
+        "--flow_uniform_static_ratio",
+        type=float,
+        default=None,
+        help="use a fixed sqrt(m/n) ratio (e.g. 2.5) for uniform Rectified Flow timestep shift; overrides resolution-based shift / 一定のsqrt(m/n)比率（例:2.5）でUniformなRectified Flowタイムステップをシフトする（解像度依存シフトを上書き）",
+    )
+    parser.add_argument(
+        "--contrastive_flow_matching",
+        action="store_true",
+        help="Enable Contrastive Flow Matching (ΔFM) objective. Works with v-parameterization or Rectified Flow.",
+    )
+    parser.add_argument(
+        "--cfm_lambda",
+        type=float,
+        default=0.05,
+        help="Lambda weight for the contrastive term in ΔFM loss (default: 0.05).",
     )
     # parser.add_argument("--loraplus_lr_ratio", default=None, type=float, help="LoRA+ learning rate ratio")
     # parser.add_argument("--loraplus_unet_lr_ratio", default=None, type=float, help="LoRA+ UNet learning rate ratio")

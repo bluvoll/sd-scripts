@@ -16,6 +16,7 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         super().__init__()
         self.vae_scale_factor = sdxl_model_util.VAE_SCALE_FACTOR
         self.is_sdxl = True
+        self.latent_shift = 0.0
 
     def assert_extra_args(self, args, train_dataset_group):
         sdxl_train_util.verify_sdxl_training_args(args)
@@ -54,6 +55,21 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
 
     def is_text_encoder_outputs_cached(self, args):
         return args.cache_text_encoder_outputs
+
+    def get_flow_pixel_counts(self, args, batch, latents):
+        if (
+            getattr(args, "flow_model", False)
+            and args.flow_timestep_distribution == "uniform"
+            and args.flow_uniform_shift
+            and args.flow_uniform_static_ratio is None
+        ):
+            target_size = batch.get("target_sizes_hw")
+            if target_size is None:
+                raise ValueError(
+                    "Resolution-dependent uniform Rectified Flow shift requires target size information in the batch."
+                )
+            return (target_size[:, 0] * target_size[:, 1]).to(latents.device, torch.float32)
+        return None
 
     def cache_text_encoder_outputs_if_needed(
         self, args, accelerator, unet, vae, tokenizers, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
