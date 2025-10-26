@@ -37,3 +37,7 @@ Uses Deepghs' danbooru webp from 0000 to 0065 with the *exact same* tags as Noob
 ## Why tho?
 
 Just sharing the codebase used to train the Rectified Flow model, so both people that know can scrutinize it, and people that *think* they do can shit on it.
+
+## How to train?
+
+Activate venv, install missing shit, edit config and dataset toml as per your needs run launch_all_training.sh, or run accelerate manually, simple as that.
