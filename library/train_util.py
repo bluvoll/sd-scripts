@@ -4158,6 +4158,14 @@ def get_optimizer(args, trainable_params):
         logger.info(f"use Lion optimizer | {optimizer_kwargs}")
         optimizer_class = lion_pytorch.Lion
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+    if optimizer_type == "AdamW8Kahan".lower():
+        try:
+            from library.custom_optimizer.adamw_8bit import AdamW8bitKahan
+        except ImportError:
+            raise ImportError("AdamW8Kahan failed to import")
+        print(f"Using AdamW8Bit with Kahan Summation, remember to give it args!. | {optimizer_kwargs}")
+        optimizer_class = AdamW8bitKahan
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     elif optimizer_type.endswith("8bit".lower()):
         try:
