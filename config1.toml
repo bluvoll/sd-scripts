@@ -1,5 +1,5 @@
 [additional_network_arguments]
-unet_lr            = 7e-4
+unet_lr            = 5e-4
 text_encoder_lr    = 2e-5
 network_dim        = 32
 network_alpha      = 32
@@ -9,7 +9,7 @@ network_args       = ['conv_dim=24', 'conv_alpha=24.0', 'algo=locon', 'preset=fu
 [optimizer_arguments]
 lr_scheduler       = "constant_with_warmup"
 optimizer_type     = "AdamW8bit"
-optimizer_args     = ["weight_decay=2e-5"]
+optimizer_args     = ["weight_decay=0.01"]
 min_lr             = 0
 
 [training_arguments]
