@@ -612,6 +612,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.tokenizers = tokenizer if isinstance(tokenizer, list) else [tokenizer]
 
         self.max_token_length = max_token_length
+        self.use_zero_cond_dropout = False
+        logger.info("--use_zero_cond_dropout is not implemented for caching text encoder outputs")
         # width/height is used when enable_bucket==False
         self.width, self.height = (None, None) if resolution is None else resolution
         self.network_multiplier = network_multiplier
@@ -1155,7 +1157,7 @@ class BaseDataset(torch.utils.data.Dataset):
             input_ids1 = torch.stack(input_ids1, dim=0)
             input_ids2 = torch.stack(input_ids2, dim=0)
             cache_batch_text_encoder_outputs(
-                infos, tokenizers, text_encoders, self.max_token_length, cache_to_disk, input_ids1, input_ids2, weight_dtype
+                infos, tokenizers, text_encoders, self.max_token_length, cache_to_disk, self.use_zero_cond_dropout, input_ids1, input_ids2, weight_dtype
             )
 
     def get_image_size(self, image_path):
@@ -2614,7 +2616,7 @@ def cache_batch_latents(
 
 
 def cache_batch_text_encoder_outputs(
-    image_infos, tokenizers, text_encoders, max_token_length, cache_to_disk, input_ids1, input_ids2, dtype
+    image_infos, tokenizers, text_encoders, max_token_length, cache_to_disk, use_zero_cond_dropout, input_ids1, input_ids2, dtype
 ):
     input_ids1 = input_ids1.to(text_encoders[0].device)
     input_ids2 = input_ids2.to(text_encoders[1].device)
@@ -2622,6 +2624,7 @@ def cache_batch_text_encoder_outputs(
     with torch.no_grad():
         b_hidden_state1, b_hidden_state2, b_pool2 = get_hidden_states_sdxl(
             max_token_length,
+            use_zero_cond_dropout,
             input_ids1,
             input_ids2,
             tokenizers[0],
@@ -4846,6 +4849,7 @@ def pool_workaround(
 
 def get_hidden_states_sdxl(
     max_token_length: int,
+    use_zero_cond_dropout: bool,
     input_ids1: torch.Tensor,
     input_ids2: torch.Tensor,
     tokenizer1: CLIPTokenizer,

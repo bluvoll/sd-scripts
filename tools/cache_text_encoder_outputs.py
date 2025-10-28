@@ -163,7 +163,7 @@ def cache_to_disk(args: argparse.Namespace) -> None:
             b_input_ids1 = torch.stack([image_info.input_ids1 for image_info in image_infos])
             b_input_ids2 = torch.stack([image_info.input_ids2 for image_info in image_infos])
             train_util.cache_batch_text_encoder_outputs(
-                image_infos, tokenizers, text_encoders, args.max_token_length, True, b_input_ids1, b_input_ids2, weight_dtype
+                image_infos, tokenizers, text_encoders, args.max_token_length, args.use_zero_cond_dropout, True, b_input_ids1, b_input_ids2, weight_dtype
             )
 
     accelerator.wait_for_everyone()

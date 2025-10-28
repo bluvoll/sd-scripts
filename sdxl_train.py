@@ -707,6 +707,7 @@ def train(args):
                         # unwrap_model is fine for models not wrapped by accelerator
                         encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
                             args.max_token_length,
+                            args.use_zero_cond_dropout,
                             input_ids1,
                             input_ids2,
                             tokenizer1,
@@ -1109,6 +1110,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.05,
         help="Lambda weight for the contrastive term in ΔFM loss (default: 0.05).",
+    )
+    parser.add_argument(
+        "--use_zero_cond_dropout",
+        type=bool,
+        default=False,
+        help="For full caption dropout, use zero conditioning instead of empty caption"
     )
     return parser
 
