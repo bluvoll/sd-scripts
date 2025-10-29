@@ -4877,7 +4877,7 @@ def get_hidden_states_sdxl(
 
     # handle the case when we have an empty batch due to rearranging
     if use_zero_cond_dropout and (len(input_ids1) == 0):
-        print("got the entire batch of empty conditionings!")
+        #print("got the entire batch of empty conditionings!")
         hidden_states1 = torch.zeros(
             (b_size_flat, tokenizer1.model_max_length, text_encoder1.config.hidden_size),
             device=input_ids1.device
