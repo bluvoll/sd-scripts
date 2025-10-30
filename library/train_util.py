@@ -4871,26 +4871,33 @@ def get_hidden_states_sdxl(
     if use_zero_cond_dropout:
         b_size_flat = input_ids1.size()[0]
         # input ids for empty strings are [1 x bos_token_id + 76 x eos_token_id]
-        non_empty_indices = torch.where(input_ids1[:, 1] != tokenizer1.eos_token_id)[0]
-        input_ids1 = input_ids1[non_empty_indices]
-        input_ids2 = input_ids2[non_empty_indices]
+        non_empty_mask = input_ids1[:, 1] != tokenizer1.eos_token_id
+        not_empty = non_empty_mask.any()
+        # non_empty_indices = torch.where(non_empty_mask)[0]
+        input_ids1 = input_ids1[non_empty_mask]
+        input_ids2 = input_ids2[non_empty_mask]
 
-    # handle the case when we have an empty batch due to rearranging
-    if use_zero_cond_dropout and (len(input_ids1) == 0):
-        #print("got the entire batch of empty conditionings!")
-        hidden_states1 = torch.zeros(
+        # allocate zeros
+        hidden_states1_zeros = torch.zeros(
             (b_size_flat, tokenizer1.model_max_length, text_encoder1.config.hidden_size),
             device=input_ids1.device
         )
-        hidden_states2 = torch.zeros(
+        hidden_states2_zeros = torch.zeros(
             (b_size_flat, tokenizer2.model_max_length, text_encoder2.config.hidden_size), 
             device=input_ids2.device
         )
-        pool2 = torch.zeros(
+        pool2_zeros = torch.zeros(
             (b_size_flat, text_encoder2.config.projection_dim),
             device=input_ids2.device
         )
-    else:  # compute clip embeddings
+
+    # handle the case when we have an empty batch due to rearranging
+    if use_zero_cond_dropout and (not not_empty):
+        #print("got the entire batch of empty conditionings!")
+        hidden_states1 = hidden_states1_zeros
+        hidden_states2 = hidden_states2_zeros
+        pool2 = pool2_zeros
+    else:
         # text_encoder1
         enc_out = text_encoder1(input_ids1, output_hidden_states=True, return_dict=True)
         hidden_states1 = enc_out["hidden_states"][11]
@@ -4903,28 +4910,15 @@ def get_hidden_states_sdxl(
         unwrapped_text_encoder2 = text_encoder2 if accelerator is None else accelerator.unwrap_model(text_encoder2)
         pool2 = pool_workaround(unwrapped_text_encoder2, enc_out["last_hidden_state"], input_ids2, tokenizer2.eos_token_id)
 
-    # reassemble the outputs by copying the computed embeddings into zeroed out placeholders
-    if use_zero_cond_dropout and (len(input_ids1) > 0):
-        hidden_states1_zeros = torch.zeros(
-            (b_size_flat, tokenizer1.model_max_length, text_encoder1.config.hidden_size),
-            device=hidden_states1.device
-        )
-        hidden_states2_zeros = torch.zeros(
-            (b_size_flat, tokenizer2.model_max_length, text_encoder2.config.hidden_size), 
-            device=hidden_states2.device
-        )
-        pool2_zeros = torch.zeros(
-            (b_size_flat, text_encoder2.config.projection_dim),
-            device=pool2.device
-        )
+        # reassemble the outputs by copying the computed embeddings into placeholders
+        if use_zero_cond_dropout: 
+            hidden_states1_zeros[non_empty_mask] = hidden_states1
+            hidden_states2_zeros[non_empty_mask] = hidden_states2
+            pool2_zeros[non_empty_mask] = pool2
 
-        hidden_states1_zeros[non_empty_indices] = hidden_states1
-        hidden_states2_zeros[non_empty_indices] = hidden_states2
-        pool2_zeros[non_empty_indices] = pool2
-
-        hidden_states1 = hidden_states1_zeros
-        hidden_states2 = hidden_states2_zeros
-        pool2 = pool2_zeros
+            hidden_states1 = hidden_states1_zeros
+            hidden_states2 = hidden_states2_zeros
+            pool2 = pool2_zeros
 
     # b*n, 77, 768 or 1280 -> b, n*77, 768 or 1280
     n_size = 1 if max_token_length is None else max_token_length // 75
