@@ -612,6 +612,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.tokenizers = tokenizer if isinstance(tokenizer, list) else [tokenizer]
 
         self.max_token_length = max_token_length
+        self.use_zero_cond_dropout = False
+        logger.info("--use_zero_cond_dropout is not implemented for caching text encoder outputs")
         # width/height is used when enable_bucket==False
         self.width, self.height = (None, None) if resolution is None else resolution
         self.network_multiplier = network_multiplier
@@ -1155,7 +1157,7 @@ class BaseDataset(torch.utils.data.Dataset):
             input_ids1 = torch.stack(input_ids1, dim=0)
             input_ids2 = torch.stack(input_ids2, dim=0)
             cache_batch_text_encoder_outputs(
-                infos, tokenizers, text_encoders, self.max_token_length, cache_to_disk, input_ids1, input_ids2, weight_dtype
+                infos, tokenizers, text_encoders, self.max_token_length, cache_to_disk, self.use_zero_cond_dropout, input_ids1, input_ids2, weight_dtype
             )
 
     def get_image_size(self, image_path):
@@ -2614,7 +2616,7 @@ def cache_batch_latents(
 
 
 def cache_batch_text_encoder_outputs(
-    image_infos, tokenizers, text_encoders, max_token_length, cache_to_disk, input_ids1, input_ids2, dtype
+    image_infos, tokenizers, text_encoders, max_token_length, cache_to_disk, use_zero_cond_dropout, input_ids1, input_ids2, dtype
 ):
     input_ids1 = input_ids1.to(text_encoders[0].device)
     input_ids2 = input_ids2.to(text_encoders[1].device)
@@ -2622,6 +2624,7 @@ def cache_batch_text_encoder_outputs(
     with torch.no_grad():
         b_hidden_state1, b_hidden_state2, b_pool2 = get_hidden_states_sdxl(
             max_token_length,
+            use_zero_cond_dropout,
             input_ids1,
             input_ids2,
             tokenizers[0],
@@ -4846,6 +4849,7 @@ def pool_workaround(
 
 def get_hidden_states_sdxl(
     max_token_length: int,
+    use_zero_cond_dropout: bool,
     input_ids1: torch.Tensor,
     input_ids2: torch.Tensor,
     tokenizer1: CLIPTokenizer,
@@ -4860,17 +4864,61 @@ def get_hidden_states_sdxl(
     input_ids1 = input_ids1.reshape((-1, tokenizer1.model_max_length))  # batch_size*n, 77
     input_ids2 = input_ids2.reshape((-1, tokenizer2.model_max_length))  # batch_size*n, 77
 
-    # text_encoder1
-    enc_out = text_encoder1(input_ids1, output_hidden_states=True, return_dict=True)
-    hidden_states1 = enc_out["hidden_states"][11]
+    #for i, s in enumerate(tokenizer1.batch_decode(input_ids1, skip_special_tokens=True)):
+    #    print(f"[{i}]: {len(tokenizer1.tokenize(s))} -> {s}")
+    
+    # rearrange the token ids to avoid unnecessary computation when using zero cond dropout
+    if use_zero_cond_dropout:
+        b_size_flat = input_ids1.size()[0]
+        # input ids for empty strings are [1 x bos_token_id + 76 x eos_token_id]
+        non_empty_mask = input_ids1[:, 1] != tokenizer1.eos_token_id
+        not_empty = non_empty_mask.any()
+        # non_empty_indices = torch.where(non_empty_mask)[0]
+        input_ids1 = input_ids1[non_empty_mask]
+        input_ids2 = input_ids2[non_empty_mask]
 
-    # text_encoder2
-    enc_out = text_encoder2(input_ids2, output_hidden_states=True, return_dict=True)
-    hidden_states2 = enc_out["hidden_states"][-2]  # penuultimate layer
+        # allocate zeros
+        hidden_states1_zeros = torch.zeros(
+            (b_size_flat, tokenizer1.model_max_length, text_encoder1.config.hidden_size),
+            device=input_ids1.device
+        )
+        hidden_states2_zeros = torch.zeros(
+            (b_size_flat, tokenizer2.model_max_length, text_encoder2.config.hidden_size), 
+            device=input_ids2.device
+        )
+        pool2_zeros = torch.zeros(
+            (b_size_flat, text_encoder2.config.projection_dim),
+            device=input_ids2.device
+        )
 
-    # pool2 = enc_out["text_embeds"]
-    unwrapped_text_encoder2 = text_encoder2 if accelerator is None else accelerator.unwrap_model(text_encoder2)
-    pool2 = pool_workaround(unwrapped_text_encoder2, enc_out["last_hidden_state"], input_ids2, tokenizer2.eos_token_id)
+    # handle the case when we have an empty batch due to rearranging
+    if use_zero_cond_dropout and (not not_empty):
+        #print("got the entire batch of empty conditionings!")
+        hidden_states1 = hidden_states1_zeros
+        hidden_states2 = hidden_states2_zeros
+        pool2 = pool2_zeros
+    else:
+        # text_encoder1
+        enc_out = text_encoder1(input_ids1, output_hidden_states=True, return_dict=True)
+        hidden_states1 = enc_out["hidden_states"][11]
+
+        # text_encoder2
+        enc_out = text_encoder2(input_ids2, output_hidden_states=True, return_dict=True)
+        hidden_states2 = enc_out["hidden_states"][-2]  # penuultimate layer
+
+        # pool2 = enc_out["text_embeds"]
+        unwrapped_text_encoder2 = text_encoder2 if accelerator is None else accelerator.unwrap_model(text_encoder2)
+        pool2 = pool_workaround(unwrapped_text_encoder2, enc_out["last_hidden_state"], input_ids2, tokenizer2.eos_token_id)
+
+        # reassemble the outputs by copying the computed embeddings into placeholders
+        if use_zero_cond_dropout: 
+            hidden_states1_zeros[non_empty_mask] = hidden_states1
+            hidden_states2_zeros[non_empty_mask] = hidden_states2
+            pool2_zeros[non_empty_mask] = pool2
+
+            hidden_states1 = hidden_states1_zeros
+            hidden_states2 = hidden_states2_zeros
+            pool2 = pool2_zeros
 
     # b*n, 77, 768 or 1280 -> b, n*77, 768 or 1280
     n_size = 1 if max_token_length is None else max_token_length // 75
@@ -4908,6 +4956,7 @@ def get_hidden_states_sdxl(
         hidden_states1 = hidden_states1.to(weight_dtype)
         hidden_states2 = hidden_states2.to(weight_dtype)
 
+    #print(hidden_states1)
     return hidden_states1, hidden_states2, pool2
 
 

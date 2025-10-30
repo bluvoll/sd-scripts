@@ -418,6 +418,7 @@ def train(args):
                         input_ids2 = input_ids2.to(accelerator.device)
                         encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
                             args.max_token_length,
+                            args.use_zero_cond_dropout,
                             input_ids1,
                             input_ids2,
                             tokenizer1,
@@ -610,6 +611,12 @@ def setup_parser() -> argparse.ArgumentParser:
         "--no_half_vae",
         action="store_true",
         help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
+    )
+    parser.add_argument(
+        "--use_zero_cond_dropout",
+        type=bool,
+        default=False,
+        help="For full caption dropout, use zero conditioning instead of empty caption"
     )
     return parser
 
